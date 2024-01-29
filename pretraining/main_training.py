@@ -21,7 +21,7 @@ import config
 import policies
 from pretraining.utils.config_utils import update_config
 from pretraining.utils.dataset_utils import get_data_loader, get_dummy_loader
-from pretraining.utils.train_utils import setup, setup_environ_flags, get_policies, train, get_profiler
+from pretraining.utils.train_utils import setup, setup_environ_flags, get_policies, train, get_profiler, cleanup
 
 
 def main(**kwargs):
@@ -33,24 +33,24 @@ def main(**kwargs):
     torch.cuda.manual_seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
+    # some setups
+    setup_environ_flags()
+    setup()
+
     # torchrun specific
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-
     if rank == 0:
         print(f"--> running with these configs {cfg}")
 
-    # some setups
-    setup()
     torch.cuda.set_device(local_rank)
     torch.cuda.empty_cache()
-    setup_environ_flags()
 
     # get policy
     mixed_precision_policy, wrapping_policy, sharding_strategy_policy = get_policies(cfg, rank)
 
-    # get fms model
+    # get fms model (7B)
     llama_config = LLaMAConfig(
         src_vocab_size=32000,
         emb_dim=4096,
@@ -62,14 +62,35 @@ def main(**kwargs):
         activation_fn="silu",
         max_expected_seq_len=2048,
     )
+
+    # https://github.com/MEllis-github/foundation-model-stack/blob/7e6f5f5204b1d01b830881ddbde168eaff24310b/fms/models/llama.py#L462
+    # https://huggingface.co/TheBloke/Llama-2-70B-fp16/blob/main/config.json
+    # llama_config = LLaMAConfig(
+    #     src_vocab_size=50304,
+    #     emb_dim=8192,
+    #     norm_eps=1e-05,
+    #     nheads=64,
+    #     nlayers=80,
+    #     kvheads=8,  
+    #     hidden_grow_factor=3.5,
+    #     multiple_of=1,
+    #     activation_fn="swish",
+    #     max_expected_seq_len=4096,
+    # )
+
     if cfg.low_cpu_fsdp:
-        if rank == 0:
-            model = LLaMA(llama_config, orig_init=True)
-        else:
-            with torch.device("meta"):
-                model = LLaMA(llama_config, orig_init=True)
+        with torch.device("meta"):
+            model = LLaMA(llama_config, orig_init=True) #, attn_algorithm="math") # try forcing attention algorithm
+        # if rank == 0:
+        #     print("loading model...")
+        #     model = LLaMA(llama_config, orig_init=True)
+        # else:
+        #     with torch.device("meta"):
+        #         model = LLaMA(llama_config, orig_init=True)
     else:
         model = LLaMA(llama_config, orig_init=True)
+    
+    print("model loaded")
 
     if rank == 0:
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -123,10 +144,12 @@ def main(**kwargs):
         limit_all_gathers=True,
         sync_module_states=cfg.low_cpu_fsdp,
         param_init_fn=lambda module: module.to_empty(device=torch.device("cuda"), recurse=False)
-        if cfg.low_cpu_fsdp and rank != 0 else None,
-        device_mesh=init_device_mesh("cuda", (world_size // cfg.sharding_group_size, cfg.sharding_group_size))
-        if cfg.sharding_strategy == "hsdp" else None,
+        if cfg.low_cpu_fsdp else None,
     )
+        # param_init_fn=lambda module: module.to_empty(device=torch.device("cuda"), recurse=False)
+        # if cfg.low_cpu_fsdp and rank != 0 else None,
+        # device_mesh=init_device_mesh("cuda", (world_size // cfg.sharding_group_size, cfg.sharding_group_size))
+        # if cfg.sharding_strategy == "hsdp" else None,
 
     # fsdp activation checkpointing
     if cfg.fsdp_activation_checkpointing:
@@ -178,8 +201,7 @@ def main(**kwargs):
         tokens_seen,
     )
 
-    dist.barrier()
-    dist.destroy_process_group()
+    cleanup()
 
 
 if __name__ == "__main__":

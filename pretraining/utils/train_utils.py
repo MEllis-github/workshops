@@ -54,16 +54,17 @@ def train(
             profiler.step()
 
         if batch_idx % cfg.report_interval == 0:
+            time_now = time.time()
+            elapsed_time = time_now - loop_start
             dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
             train_accuracy = ddp_loss[0] / ddp_loss[1]
-            elapsed_time = time.time() - loop_start
             world_size = int(os.environ["WORLD_SIZE"])
             elapsed_tokens = (batch_idx - start_step) * world_size * cfg.batch_size * cfg.seq_length // cfg.tp_size
             if rank == 0:
                 print("step:", batch_idx)
                 print("tokens seen:", n_tok + elapsed_tokens)
                 print("loss:", train_accuracy.item())
-                print(f"speed for these {cfg.report_interval} steps:", (time.time() - start) / cfg.report_interval)
+                print(f"speed for these {cfg.report_interval} steps:", (time_now - start) / cfg.report_interval)
                 print("overall speed:", elapsed_time / (batch_idx - start_step))
                 print("reserved memory:", torch.cuda.max_memory_reserved(device=torch.cuda.current_device()))
                 print("active memory:", torch.cuda.max_memory_allocated(device=torch.cuda.current_device()))
@@ -86,7 +87,37 @@ def train(
 
 
 def setup():
-    dist.init_process_group("nccl")
+    """Initialize the process group for distributed training"""
+    # https://github.com/michael-sandoval/hybrid_quantum_hpc/blob/main/frontier_qml/cnn_qml_distributed_mpi_1GpuPerTask.py#L337
+    n_gpus_total = torch.cuda.device_count()
+    print(f'Total GPUs on the system: {n_gpus_total}')
+
+    from mpi4py import MPI
+    comm = MPI.COMM_WORLD
+    world_size = comm.Get_size()
+    world_rank = rank = comm.Get_rank()
+    backend = None
+    os.environ['WORLD_SIZE'] = str(world_size)
+    os.environ['RANK'] = str(world_rank)
+    os.environ['LOCAL_RANK'] = "0"
+
+    master_addr = os.environ["MASTER_ADDR"]
+    os.environ['MASTER_ADDR'] = master_addr #'localhost'
+    os.environ['MASTER_PORT'] = '29500'
+    os.environ['NCCL_SOCKET_IFNAME'] = 'hsn0' #added
+    print(f'Total GPUs being used this run: {world_size}')
+
+    dist.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
+    #dist.init_process_group("nccl")
+
+
+def cleanup():
+    """Clean up the process group after training"""
+    dist.barrier()
+    dist.destroy_process_group()
+
+    from mpi4py import MPI
+    if MPI.Is_initialized(): MPI.Finalize()
 
 
 def setup_environ_flags():
@@ -98,9 +129,8 @@ def get_policies(cfg, rank):
     """Get the policies for mixed precision and fsdp wrapping and sharding strategy"""
 
     verify_bfloat_support = (
-            torch.version.cuda
+            (torch.version.hip or (torch.version.cuda and packaging.version.parse(torch.version.cuda).release >= (11, 0)))
             and torch.cuda.is_bf16_supported()
-            and packaging.version.parse(torch.version.cuda).release >= (11, 0)
             and dist.is_nccl_available()
             and nccl.version() >= (2, 10)
     )
